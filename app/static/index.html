@@ -179,7 +179,7 @@ function renderEvaluation(ev) {
         <td>${fmtTs(r.expires_at)}${r.expired?" <span class='tag-rej'>已过期</span>":""}</td>
         <td>${pill(r.signature_ok,"通过","失败")}${r.error?` <span class="tag-rej">${r.error}</span>`:""}</td></tr>`).join("") +
       "</tbody></table>" +
-      (ev.revoked_by_persisted ? "<p class='tag-rej' style='margin-top:6px'>注意：该叶项在站内撤销名册中已全局失效（即使本包剥离撤销声明仍拒绝）。</p>" : "");
+      (ev.revoked_by_persisted ? "<p class='tag-rej' style='margin-top:6px'>注意：该叶项已被站内撤销名册收录，对该签发根持久失效（即使本包剥离撤销声明仍拒绝）。</p>" : "");
   }
 }
 

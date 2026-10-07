@@ -1,14 +1,19 @@
 """持久化裁决层。
 
-两张表（SQLite，落盘到可挂载卷）：
+三张表（SQLite，落盘到可挂载卷）：
 - decisions       ：每个 request_digest 恰好一行的裁决（EXECUTED / REJECTED）；
-- consumed_leaves ：已驱动过设备的末级凭据（leaf_id），用于"一次性凭据"。
+- consumed_leaves ：已驱动过设备的末级凭据，用于"一次性凭据"；
+- revoked_leaves  ：经根公钥验签入册的撤销名册。
+
+撤销名册与一次性消耗均按 **(签发根 root_pubkey, leaf_id)** 定位：两个独立
+根公钥可以签发内容完全相同的叶项 header（leaf_id 相同而签名与签发根不同），
+根 A 的撤销或消耗不得影响根 B 的合法凭据。
 
 并发提交 / 响应丢失重传的收敛由单写事务保证：
 ``BEGIN IMMEDIATE`` 立即取 RESERVED 写锁，后到者在锁上等待后必能读到
 已提交裁决，于是同 request_digest 永远返回同一回执；
-同 leaf_id 的不同请求只可能有一个进入执行，其余得到 LEAF_CONSUMED。
-数据库文件持久化挂载，重启后可逐字复核。
+同一签发根下同 leaf_id 的不同请求只可能有一个进入执行，其余得到
+LEAF_CONSUMED。数据库文件持久化挂载，重启后可逐字复核。
 """
 from __future__ import annotations
 
@@ -38,16 +43,25 @@ CREATE TABLE IF NOT EXISTS decisions (
     executed_at    INTEGER
 );
 CREATE TABLE IF NOT EXISTS consumed_leaves (
-    leaf_id        TEXT PRIMARY KEY,
+    root_pubkey    TEXT NOT NULL,
+    leaf_id        TEXT NOT NULL,
     request_digest TEXT NOT NULL,
-    consumed_at    INTEGER NOT NULL
+    consumed_at    INTEGER NOT NULL,
+    PRIMARY KEY (root_pubkey, leaf_id)
 );
 CREATE TABLE IF NOT EXISTS revoked_leaves (
-    leaf_id     TEXT PRIMARY KEY,
+    root_pubkey TEXT NOT NULL,
+    leaf_id     TEXT NOT NULL,
     revoked_at  INTEGER NOT NULL,
-    source      TEXT NOT NULL
+    source      TEXT NOT NULL,
+    PRIMARY KEY (root_pubkey, leaf_id)
 );
 """
+
+# 旧库迁移占位：升级前无法归属单一签发根的撤销条目保留为通配根域，
+# 命中任一根的裁决仍视为已撤销（fail-closed，宁可误拒不可放行）。
+# 真实根公钥是 32 字节 Ed25519 公钥的 base64，不会与该哨兵冲突。
+LEGACY_GLOBAL_ROOT = "*"
 
 
 @dataclass
@@ -119,14 +133,72 @@ class DecisionStore:
         try:
             for stmt in (s.strip() for s in SCHEMA.split(";") if s.strip()):
                 conn.execute(stmt)
+            self._migrate_root_scoping(conn)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
 
+    @staticmethod
+    def _migrate_root_scoping(conn: sqlite3.Connection) -> None:
+        """旧库迁移：撤销名册 / 一次性消耗从仅按 leaf_id 升级为按
+        (root_pubkey, leaf_id) 定位。
+
+        - consumed_leaves 的既有行经 decisions.request_digest 找回签发根，平移保留；
+        - revoked_leaves 的既有行无法归属单一签发根，保留为通配根域
+          （LEGACY_GLOBAL_ROOT），对任一根的裁决依旧生效（fail-closed）。
+        """
+        consumed_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(consumed_leaves)")
+        }
+        if consumed_cols and "root_pubkey" not in consumed_cols:
+            conn.execute("ALTER TABLE consumed_leaves RENAME TO consumed_leaves_legacy")
+            conn.execute(
+                "CREATE TABLE consumed_leaves ("
+                " root_pubkey TEXT NOT NULL, leaf_id TEXT NOT NULL,"
+                " request_digest TEXT NOT NULL, consumed_at INTEGER NOT NULL,"
+                " PRIMARY KEY (root_pubkey, leaf_id))"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO consumed_leaves "
+                "SELECT d.root_pubkey, c.leaf_id, c.request_digest, c.consumed_at "
+                "FROM consumed_leaves_legacy c "
+                "JOIN decisions d ON d.request_digest = c.request_digest"
+            )
+            conn.execute("DROP TABLE consumed_leaves_legacy")
+
+        revoked_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(revoked_leaves)")
+        }
+        if revoked_cols and "root_pubkey" not in revoked_cols:
+            conn.execute("ALTER TABLE revoked_leaves RENAME TO revoked_leaves_legacy")
+            conn.execute(
+                "CREATE TABLE revoked_leaves ("
+                " root_pubkey TEXT NOT NULL, leaf_id TEXT NOT NULL,"
+                " revoked_at INTEGER NOT NULL, source TEXT NOT NULL,"
+                " PRIMARY KEY (root_pubkey, leaf_id))"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO revoked_leaves "
+                "SELECT ?, leaf_id, revoked_at, source FROM revoked_leaves_legacy",
+                (LEGACY_GLOBAL_ROOT,),
+            )
+            conn.execute("DROP TABLE revoked_leaves_legacy")
+
     # ------------------------------------------------------------------ #
-    def revoked_set(self) -> set[str]:
-        rows = self._conn().execute("SELECT leaf_id FROM revoked_leaves").fetchall()
+    def revoked_set(self, root_pubkey: str | None = None) -> set[str]:
+        """站内已入册的撤销叶项标识。
+
+        指定 root_pubkey 时只返回该签发根域内（含历史通配条目）的撤销；
+        不传则返回全部名册（台账断言等用途）。
+        """
+        if root_pubkey is None:
+            rows = self._conn().execute("SELECT leaf_id FROM revoked_leaves").fetchall()
+        else:
+            rows = self._conn().execute(
+                "SELECT leaf_id FROM revoked_leaves WHERE root_pubkey IN (?, ?)",
+                (root_pubkey, LEGACY_GLOBAL_ROOT),
+            ).fetchall()
         return {r["leaf_id"] for r in rows}
 
     def decide_execution(
@@ -149,13 +221,14 @@ class DecisionStore:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # 本包携带的新撤销目标先原子入册（全局生效）；即使本 request_digest
-            # 已有裁决（例如撤销声明重传到达），名册也必须补齐，杜绝绕过。
+            # 本包携带的新撤销目标先原子入册（按签发根生效）；即使本
+            # request_digest 已有裁决（例如撤销声明重传到达），名册也必须
+            # 补齐，杜绝绕过。
             if new_revoked_targets:
                 conn.executemany(
-                    "INSERT OR IGNORE INTO revoked_leaves (leaf_id, revoked_at, source) "
-                    "VALUES (?,?,?)",
-                    [(t, now, "packet") for t in sorted(new_revoked_targets)],
+                    "INSERT OR IGNORE INTO revoked_leaves "
+                    "(root_pubkey, leaf_id, revoked_at, source) VALUES (?,?,?,?)",
+                    [(root_pubkey, t, now, "packet") for t in sorted(new_revoked_targets)],
                 )
 
             row = conn.execute(
@@ -166,7 +239,9 @@ class DecisionStore:
                 return self._row_to_decision(row, duplicate=True)
 
             revoked_row = conn.execute(
-                "SELECT 1 FROM revoked_leaves WHERE leaf_id = ?", (leaf_id,)
+                "SELECT 1 FROM revoked_leaves "
+                "WHERE leaf_id = ? AND root_pubkey IN (?, ?)",
+                (leaf_id, root_pubkey, LEGACY_GLOBAL_ROOT),
             ).fetchone()
             if revoked_row is not None:
                 decision = self._insert_rejected(
@@ -177,7 +252,9 @@ class DecisionStore:
                 return decision
 
             consumed = conn.execute(
-                "SELECT request_digest FROM consumed_leaves WHERE leaf_id = ?", (leaf_id,)
+                "SELECT request_digest FROM consumed_leaves "
+                "WHERE root_pubkey = ? AND leaf_id = ?",
+                (root_pubkey, leaf_id),
             ).fetchone()
             if consumed is not None and consumed["request_digest"] != digest:
                 decision = self._insert_rejected(
@@ -196,8 +273,9 @@ class DecisionStore:
                 ),
             )
             conn.execute(
-                "INSERT OR IGNORE INTO consumed_leaves VALUES (?,?,?)",
-                (leaf_id, digest, now),
+                "INSERT OR IGNORE INTO consumed_leaves "
+                "(root_pubkey, leaf_id, request_digest, consumed_at) VALUES (?,?,?,?)",
+                (root_pubkey, leaf_id, digest, now),
             )
             conn.execute("COMMIT")
             return Decision(
@@ -283,9 +361,9 @@ class DecisionStore:
         try:
             if new_revoked_targets:
                 conn.executemany(
-                    "INSERT OR IGNORE INTO revoked_leaves (leaf_id, revoked_at, source) "
-                    "VALUES (?,?,?)",
-                    [(t, now, "packet") for t in sorted(new_revoked_targets)],
+                    "INSERT OR IGNORE INTO revoked_leaves "
+                    "(root_pubkey, leaf_id, revoked_at, source) VALUES (?,?,?,?)",
+                    [(root_pubkey, t, now, "packet") for t in sorted(new_revoked_targets)],
                 )
             row = conn.execute(
                 "SELECT * FROM decisions WHERE request_digest = ?", (digest,)

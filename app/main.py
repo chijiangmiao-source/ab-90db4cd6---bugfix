@@ -56,6 +56,13 @@ def _bad_request(reason: str) -> HTTPException:
     )
 
 
+def _persisted_revoked_for(packet: Any) -> set[str]:
+    """撤销名册按签发根区分：只取本包 root_pubkey 根域内已入册的叶项标识，
+    独立根之间互不共享撤销状态。"""
+    root = packet.get("root_pubkey") if isinstance(packet, dict) else None
+    return store.revoked_set(root) if isinstance(root, str) else set()
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
     # 健康响应同时确认持久层可读
@@ -112,7 +119,7 @@ def inspect(body: SubmitBody) -> dict[str, Any]:
 
     ev = chain_mod.evaluate_packet(
         packet, int(time.time()), payload=payload, payload_signature=sig,
-        persisted_revoked=store.revoked_set(),
+        persisted_revoked=_persisted_revoked_for(packet),
     )
     return {"accepted": ev.ok, "evaluation": _evaluation_view(ev)}
 
@@ -133,7 +140,7 @@ def execute(body: SubmitBody) -> JSONResponse:
 
     ev = chain_mod.evaluate_packet(
         packet, int(time.time()), payload=payload, payload_signature=sig,
-        persisted_revoked=store.revoked_set(),
+        persisted_revoked=_persisted_revoked_for(packet),
     )
     response: dict[str, Any] = {"accepted": ev.ok, "evaluation": _evaluation_view(ev)}
 

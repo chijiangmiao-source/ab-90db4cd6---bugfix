@@ -83,7 +83,7 @@ REASON_TEXT = {
     REASON_SIGNATURE_INVALID: "逐级签名验签失败",
     REASON_SCOPE_NOT_NARROWED: "设备或命令范围未相对父项严格收窄",
     REASON_EXPIRED: "存在已过期的委托项",
-    REASON_REVOKED: "末级凭据已被有效撤销声明撤销（撤销在站内全局持久生效）",
+    REASON_REVOKED: "末级凭据已被有效撤销声明撤销（撤销一经入册即对该签发根持久生效）",
     REASON_REVOCATION_INVALID: "撤销声明结构非法、未通过根公钥验签或已过期",
     REASON_PAYLOAD_STRUCTURE: "请求载荷结构非法（需含 device/command 字符串）",
     REASON_PAYLOAD_SIGNATURE_INVALID: "请求载荷未通过叶项主体签名验证",
@@ -257,8 +257,9 @@ def evaluate_packet(
     """对委托包（可选执行载荷）执行完整裁决，返回结构化结果。
 
     纯函数：now 由调用方注入，不触碰数据库与网络。
-    persisted_revoked 为站内已持久化的全局失效标识集合——撤销一旦经根公钥
-    验证并入册，即使后续提交剥离撤销声明，命中集合的叶项仍不得驱动设备。
+    persisted_revoked 为站内已持久化的失效标识集合（调用方按本包签发根
+    过滤后传入）——撤销一旦经根公钥验证并入册，即使后续提交剥离撤销
+    声明，命中集合的叶项仍不得驱动设备。
     """
     persisted_revoked = persisted_revoked or set()
     # ---- 包结构 ----
