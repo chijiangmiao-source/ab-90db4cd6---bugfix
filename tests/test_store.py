@@ -181,7 +181,7 @@ def test_revocation_registered_blocks_stripped_replay(store_factory, keys, level
     )
     assert d.status == "REJECTED"
     assert store.execution_count() == 0
-    assert leaf_id in store.revoked_set()
+    assert (ev.root_pubkey, leaf_id) in store.revoked_set()
 
     # 攻击者剥离撤销声明重传：持久化名册仍然拒绝
     packet_clean = testkit.make_packet(keys["root"], chain)
@@ -238,11 +238,192 @@ def test_revocation_vs_execution_race(store_factory, keys, levels, valid_payload
     t1.start(); t2.start(); t1.join(); t2.join()
 
     assert store.execution_count() <= 1
-    # 撤销名册最终必然包含该叶项
-    assert leaf_id in store.revoked_set()
+    # 撤销名册最终必然包含该叶项（本根命名空间内）
+    assert (packet_rev["root_pubkey"], leaf_id) in store.revoked_set()
     # 设备最多执行一次：若执行先于撤销到达，撤销方只会拿到同一历史回执（幂等），
     # 不可能产生第二次执行；若撤销先到，执行必被 REVOKED 拒绝。
     executed = [o for o in outcomes if o.status == "EXECUTED"]
     if executed:
         assert len({o.request_digest for o in executed}) == 1
     assert store.execution_count() == (1 if executed else 0)
+
+
+# ---------------------------------------------------------------------------
+# 回归：独立签发根之间，撤销 / 一次性消耗状态必须按 (root_pubkey, leaf_id) 隔离
+# ---------------------------------------------------------------------------
+
+def _two_root_chains_same_leaf(keys, levels):
+    """两个独立根各自签发内容相同的单级（两级链）委托：header 全同 → leaf_id 相同。
+
+    根项由不同根私钥签名（签名不同），叶主体、父摘要、范围、失效时间一致，
+    于是两条链 leaf_id 相同、chain_digest 不同、签发根不同。
+    """
+    chain_a = testkit.make_chain(keys["root"], levels, FAR_FUTURE)
+    chain_b = testkit.make_chain(keys["other"], levels, FAR_FUTURE)
+    leaf_a = C.item_id_of(chain_a[-1]["header"])
+    leaf_b = C.item_id_of(chain_b[-1]["header"])
+    assert leaf_a == leaf_b  # 前置条件：叶项 header 逐字一致
+    assert C.chain_digest_of(chain_a) != C.chain_digest_of(chain_b)
+    return chain_a, chain_b, leaf_a
+
+
+def test_revocation_by_root_a_does_not_revoke_root_b(store_factory, keys, levels, valid_payload):
+    """根 A 已撤销该 leaf_id 后，根 B 的干净合法链不得被判 REVOKED。"""
+    store = store_factory()
+    now = FAR_FUTURE - 10**8
+    chain_a, chain_b, leaf_id = _two_root_chains_same_leaf(keys, levels)
+    packet_a = testkit.make_packet(keys["root"], chain_a)
+    packet_b = testkit.make_packet(keys["other"], chain_b)
+
+    # 根 A 对该叶项提交有效撤销并完成裁决（撤销原子入册）
+    crl = testkit.make_revocation(keys["root"], [leaf_id], FAR_FUTURE)
+    packet_a_rev = testkit.make_packet(keys["root"], chain_a, revocations=[crl])
+    ev_rev = C.evaluate_packet(
+        packet_a_rev, now, payload=valid_payload,
+        payload_signature=sign_payload(keys["leaf"], valid_payload),
+        persisted_revoked=store.revoked_set(),
+    )
+    assert ev_rev.first_reason == C.REASON_REVOKED
+    d_rev = store.record_decision(
+        ev_rev.root_pubkey, ev_rev.chain_digest, ev_rev.leaf_id, valid_payload,
+        execute=False, reason=ev_rev.first_reason,
+        new_revoked_targets=set(ev_rev.valid_revoked_targets),
+    )
+    assert d_rev.status == "REJECTED"
+    assert (packet_a["root_pubkey"], leaf_id) in store.revoked_set()
+
+    # 根 B 的干净合法链：不命中根 A 名下的撤销，正常裁决并执行
+    ev_b = C.evaluate_packet(
+        packet_b, now, payload=valid_payload,
+        payload_signature=sign_payload(keys["leaf"], valid_payload),
+        persisted_revoked=store.revoked_set(),
+    )
+    assert ev_b.ok is True
+    assert ev_b.first_reason is None
+    d_b = store.record_decision(
+        ev_b.root_pubkey, ev_b.chain_digest, ev_b.leaf_id, valid_payload, execute=True,
+    )
+    assert d_b.status == "EXECUTED"
+    # 根 A 名下仍无执行记录；根 B 名下恰有一条
+    assert store.execution_count(leaf_id, packet_a["root_pubkey"]) == 0
+    assert store.execution_count(leaf_id, packet_b["root_pubkey"]) == 1
+    assert store.execution_count() == 1
+
+
+def test_consumption_by_root_a_does_not_consume_root_b(store_factory, keys, levels):
+    """根 A 链执行一次后，根 B 以不同请求载荷的首次执行不得被判 LEAF_CONSUMED。"""
+    store = store_factory()
+    now = FAR_FUTURE - 10**8
+    chain_a, chain_b, leaf_id = _two_root_chains_same_leaf(keys, levels)
+    packet_a = testkit.make_packet(keys["root"], chain_a)
+    packet_b = testkit.make_packet(keys["other"], chain_b)
+
+    payload_a = {"device": "dev-a", "command": "status", "nonce": "root-a-once"}
+    payload_b = {"device": "dev-b", "command": "reboot", "nonce": "root-b-once"}
+
+    ev_a = C.evaluate_packet(
+        packet_a, now, payload=payload_a,
+        payload_signature=sign_payload(keys["leaf"], payload_a),
+        persisted_revoked=store.revoked_set(),
+    )
+    d_a = store.record_decision(
+        ev_a.root_pubkey, ev_a.chain_digest, ev_a.leaf_id, payload_a, execute=True,
+    )
+    assert d_a.status == "EXECUTED"
+
+    # 根 B 的首次执行（不同请求载荷）必须独立放行
+    ev_b = C.evaluate_packet(
+        packet_b, now, payload=payload_b,
+        payload_signature=sign_payload(keys["leaf"], payload_b),
+        persisted_revoked=store.revoked_set(),
+    )
+    assert ev_b.ok is True
+    d_b = store.record_decision(
+        ev_b.root_pubkey, ev_b.chain_digest, ev_b.leaf_id, payload_b, execute=True,
+    )
+    assert d_b.status == "EXECUTED"
+    assert d_b.reason is None
+    assert store.execution_count(leaf_id) == 2
+    assert store.execution_count(leaf_id, packet_a["root_pubkey"]) == 1
+    assert store.execution_count(leaf_id, packet_b["root_pubkey"]) == 1
+
+    # 隔离不等于放开一次性约束：根 A 再换载荷仍被 LEAF_CONSUMED 拒绝
+    payload_a2 = {"device": "dev-a", "command": "reboot", "nonce": "root-a-again"}
+    ev_a2 = C.evaluate_packet(
+        packet_a, now, payload=payload_a2,
+        payload_signature=sign_payload(keys["leaf"], payload_a2),
+        persisted_revoked=store.revoked_set(),
+    )
+    assert ev_a2.ok is True
+    d_a2 = store.record_decision(
+        ev_a2.root_pubkey, ev_a2.chain_digest, ev_a2.leaf_id, payload_a2, execute=True,
+    )
+    assert d_a2.status == "REJECTED"
+    assert d_a2.reason == C.REASON_LEAF_CONSUMED
+    assert store.execution_count(leaf_id) == 2
+
+
+def test_legacy_leaf_id_only_schema_migrates_scoped(tmp_path, keys):
+    """旧版仅以 leaf_id 建主键的名册在重启打开时升级为按根隔离，并从台账回溯签发根。"""
+    import sqlite3
+
+    from app.canonical import canonical_bytes
+
+    db = str(tmp_path / "legacy.db")
+    root_a = testkit.public_b64(keys["root"])
+    root_b = testkit.public_b64(keys["other"])
+    leaf_consumed = "a" * 64
+    leaf_revoked = "b" * 64
+    now = FAR_FUTURE - 10**8
+    payload = {"device": "dev-a", "command": "status", "nonce": "legacy"}
+    digest_exec = C.request_digest(root_a, "c" * 64, leaf_consumed, payload)
+    digest_rej = C.request_digest(root_a, "d" * 64, leaf_revoked, payload)
+    payload_json = canonical_bytes(payload).decode()
+
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE decisions (
+            request_digest TEXT PRIMARY KEY, status TEXT NOT NULL, reason TEXT,
+            command_id TEXT, output TEXT, root_pubkey TEXT NOT NULL,
+            chain_digest TEXT NOT NULL, leaf_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL, executed_at INTEGER
+        );
+        CREATE TABLE consumed_leaves (
+            leaf_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, consumed_at INTEGER NOT NULL
+        );
+        CREATE TABLE revoked_leaves (
+            leaf_id TEXT PRIMARY KEY, revoked_at INTEGER NOT NULL, source TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (digest_exec, "EXECUTED", None, "cmd-x", "out", root_a,
+         "c" * 64, leaf_consumed, payload_json, now, now),
+    )
+    conn.execute(
+        "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (digest_rej, "REJECTED", "REVOKED", None, None, root_a,
+         "d" * 64, leaf_revoked, payload_json, now, None),
+    )
+    conn.execute("INSERT INTO consumed_leaves VALUES (?,?,?)",
+                 (leaf_consumed, digest_exec, now))
+    conn.execute("INSERT INTO revoked_leaves VALUES (?,?,?)",
+                 (leaf_revoked, now, "packet"))
+    conn.commit()
+    conn.close()
+
+    store = DecisionStore(db)
+    # 旧记录按台账中的签发根归属，不凭空波及其他根
+    assert store.revoked_set() == {(root_a, leaf_revoked)}
+    row = store._conn().execute(
+        "SELECT request_digest FROM consumed_leaves WHERE root_pubkey=? AND leaf_id=?",
+        (root_a, leaf_consumed),
+    ).fetchone()
+    assert row is not None and row["request_digest"] == digest_exec
+    assert store._conn().execute(
+        "SELECT 1 FROM consumed_leaves WHERE root_pubkey=? AND leaf_id=?",
+        (root_b, leaf_consumed),
+    ).fetchone() is None
+    store.close()

@@ -252,13 +252,16 @@ def evaluate_packet(
     now: int,
     payload: Any = None,
     payload_signature: str | None = None,
-    persisted_revoked: set[str] | None = None,
+    persisted_revoked: set[tuple[str, str]] | None = None,
 ) -> Evaluation:
     """对委托包（可选执行载荷）执行完整裁决，返回结构化结果。
 
     纯函数：now 由调用方注入，不触碰数据库与网络。
-    persisted_revoked 为站内已持久化的全局失效标识集合——撤销一旦经根公钥
-    验证并入册，即使后续提交剥离撤销声明，命中集合的叶项仍不得驱动设备。
+    persisted_revoked 为站内已持久化的失效标识集合，元素为
+    ``(root_pubkey, leaf_id)``——撤销状态按**签发根公钥**隔离：不同根公钥
+    即使签发了 leaf_id 相同的叶项，根 A 的撤销也不得波及根 B 的合法链。
+    撤销一旦经根公钥验证并入册，即使后续提交剥离撤销声明，同一根下命中
+    集合的叶项仍不得驱动设备。
     """
     persisted_revoked = persisted_revoked or set()
     # ---- 包结构 ----
@@ -379,10 +382,13 @@ def evaluate_packet(
                 items=views, revocations=revocation_views,
             )
         revocation_views.append(rv)
-        # 只有引用本链真实项标识的撤销才在本裁决中生效
+        # 只有引用本链真实项标识的撤销才在本裁决中生效（撤销声明已由本包
+        # root_pubkey 验签，天然属于该根的命名空间）
         valid_revoked_targets.update(t for t in header["revokes"] if t in chain_ids)
 
-    effective = persisted_revoked | valid_revoked_targets
+    # 持久化名册按签发根隔离：只取本包 root_pubkey 名下的撤销记录
+    persisted_for_root = {leaf for root, leaf in persisted_revoked if root == root_pubkey}
+    effective = persisted_for_root | valid_revoked_targets
     hit_items = [v for v in views if v.item_id in effective]
     if hit_items:
         for v in hit_items:
@@ -396,7 +402,9 @@ def evaluate_packet(
             items=views,
             revocations=revocation_views,
             valid_revoked_targets=sorted(valid_revoked_targets),
-            revoked_by_persisted=any(v.item_id in persisted_revoked for v in hit_items),
+            revoked_by_persisted=any(
+                (root_pubkey, v.item_id) in persisted_revoked for v in hit_items
+            ),
             # 载荷即使尚未进入签名阶段也随拒绝结果携带，使撤销裁决可持久化、重传可收敛
             payload=payload if isinstance(payload, dict) else None,
         )

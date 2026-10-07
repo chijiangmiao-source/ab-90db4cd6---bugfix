@@ -200,10 +200,25 @@ def test_persisted_revocation_still_blocks_without_crl(valid_packet, keys, valid
     ev = C.evaluate_packet(
         packet, FAR_FUTURE - 10**8, payload=valid_payload,
         payload_signature=sign_payload(keys["leaf"], valid_payload),
-        persisted_revoked={leaf_id},
+        persisted_revoked={(packet["root_pubkey"], leaf_id)},
     )
     assert ev.first_reason == C.REASON_REVOKED
     assert ev.revoked_by_persisted is True
+
+
+def test_persisted_revocation_scoped_by_root(valid_packet, keys, valid_payload):
+    """根 A 对 leaf_id 的入册撤销不得波及根 B 签发的同 leaf_id 合法链。"""
+    packet, chain = valid_packet
+    leaf_id = C.item_id_of(chain[-1]["header"])
+    other_root = testkit.public_b64(keys["other"])
+    ev = C.evaluate_packet(
+        packet, FAR_FUTURE - 10**8, payload=valid_payload,
+        payload_signature=sign_payload(keys["leaf"], valid_payload),
+        persisted_revoked={(other_root, leaf_id)},  # 仅在另一根名下撤销
+    )
+    assert ev.ok is True
+    assert ev.first_reason is None
+    assert ev.revoked_by_persisted is False
 
 
 def test_malformed_packet_shapes(keys):

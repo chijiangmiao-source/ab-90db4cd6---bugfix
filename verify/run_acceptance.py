@@ -5,7 +5,8 @@
   1. 有效执行：加载/构造合法委托链 → EXECUTED，回执可按 request_digest 复核；
   2. 并发重传：同叶项同载荷并发 12 次 → 恰好一次执行、回执逐字相同；
   3. 篡改拒绝：改已签字段 / 越权命令 / 过期 / 撤销 / 剥离撤销重放 / 二次使用；
-  4. 冒烟：healthz、静态页面、内置演练包、畸形 JSON 400。
+  4. 根隔离：两个独立根签发同 leaf_id 链时，撤销 / 一次性消耗按 (根, leaf_id) 隔离；
+  5. 冒烟：healthz、静态页面、内置演练包、畸形 JSON 400。
 
 先运行 pytest 全量测试，再做在线 HTTP 场景；任一步失败即以非零状态码退出。
 """
@@ -211,8 +212,105 @@ def scenario_tamper_rejections() -> None:
           r.status_code == 400 and r.json().get("detail", {}).get("code") == C.REASON_MALFORMED_JSON)
 
 
+def scenario_root_isolation() -> None:
+    """两个独立签发根、同一叶主体与相同范围/失效时间：撤销与一次性状态按根隔离。"""
+    print("\n=== 场景 4：独立签发根不共享撤销 / 一次性消耗状态 ===")
+    keys, levels = fresh_keys_and_levels()
+    root_b = testkit.generate_private_key()  # 第二个独立根
+
+    chain_a = testkit.make_chain(keys["root"], levels, FAR_FUTURE)
+    chain_b = testkit.make_chain(root_b, levels, FAR_FUTURE)
+    leaf_id = C.item_id_of(chain_a[-1]["header"])
+    check("两条链 leaf_id 相同（仅签发根/签名不同）",
+          leaf_id == C.item_id_of(chain_b[-1]["header"]),
+          f"{leaf_id} vs {C.item_id_of(chain_b[-1]['header'])}")
+
+    # ---- 隔离 A：根 A 撤销后，根 B 的干净链不被误判 REVOKED ----
+    crl = testkit.make_revocation(keys["root"], [leaf_id], FAR_FUTURE)
+    packet_a_rev = testkit.make_packet(keys["root"], chain_a, revocations=[crl])
+    payload_rev = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    body_a_rev = {
+        "packet_text": canonicalize(packet_a_rev),
+        "request_text": canonicalize(
+            {"payload": payload_rev,
+             "payload_signature": sign_payload(keys["leaf"], payload_rev)}
+        ),
+    }
+    _, j_rev = post_execute(body_a_rev)
+    check("根 A 携带有效撤销 → REVOKED",
+          j_rev.get("evaluation", {}).get("first_reason") == C.REASON_REVOKED,
+          str(j_rev.get("evaluation", {}).get("first_reason")))
+
+    payload_b = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    packet_b_clean = testkit.make_packet(root_b, chain_b)
+    body_b = {
+        "packet_text": canonicalize(packet_b_clean),
+        "request_text": canonicalize(
+            {"payload": payload_b,
+             "payload_signature": sign_payload(keys["leaf"], payload_b)}
+        ),
+    }
+    code_b, j_b = post_execute(body_b)
+    check("根 A 已撤销，根 B 干净链仍正常 EXECUTED（非 REVOKED）",
+          code_b == 200 and j_b.get("accepted") is True
+          and (j_b.get("receipt") or {}).get("status") == "EXECUTED",
+          str(j_b.get("evaluation", {}).get("first_reason")))
+
+    # ---- 隔离 B：根 A 已消费后，根 B 不同载荷的首次执行不被误判 LEAF_CONSUMED ----
+    keys2, levels2 = fresh_keys_and_levels()
+    root2_b = testkit.generate_private_key()
+    chain2_a = testkit.make_chain(keys2["root"], levels2, FAR_FUTURE)
+    chain2_b = testkit.make_chain(root2_b, levels2, FAR_FUTURE)
+    leaf2 = C.item_id_of(chain2_a[-1]["header"])
+    assert leaf2 == C.item_id_of(chain2_b[-1]["header"])
+
+    payload2_a = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    body2_a = {
+        "packet_text": canonicalize(testkit.make_packet(keys2["root"], chain2_a)),
+        "request_text": canonicalize(
+            {"payload": payload2_a,
+             "payload_signature": sign_payload(keys2["leaf"], payload2_a)}
+        ),
+    }
+    _, j2_a = post_execute(body2_a)
+    check("根 A 链完成一次执行",
+          (j2_a.get("receipt") or {}).get("status") == "EXECUTED",
+          str(j2_a.get("evaluation", {}).get("first_reason")))
+
+    # 不同请求载荷（设备/命令/nonce 均不同），根 B 的首次执行
+    payload2_b = {"device": "dev-b", "command": "reboot", "nonce": os.urandom(8).hex()}
+    body2_b = {
+        "packet_text": canonicalize(testkit.make_packet(root2_b, chain2_b)),
+        "request_text": canonicalize(
+            {"payload": payload2_b,
+             "payload_signature": sign_payload(keys2["leaf"], payload2_b)}
+        ),
+    }
+    _, j2_b = post_execute(body2_b)
+    check("根 A 已消费，根 B 首次执行仍 EXECUTED（非 LEAF_CONSUMED）",
+          j2_b.get("accepted") is True
+          and (j2_b.get("receipt") or {}).get("status") == "EXECUTED"
+          and j2_b.get("evaluation", {}).get("first_reason") is None,
+          str(j2_b.get("evaluation", {}).get("first_reason")))
+
+    # 隔离不等于放开一次性约束：根 A 再换载荷仍必须 LEAF_CONSUMED
+    payload2_a2 = {"device": "dev-b", "command": "reboot", "nonce": os.urandom(8).hex()}
+    body2_a2 = {
+        "packet_text": canonicalize(testkit.make_packet(keys2["root"], chain2_a)),
+        "request_text": canonicalize(
+            {"payload": payload2_a2,
+             "payload_signature": sign_payload(keys2["leaf"], payload2_a2)}
+        ),
+    }
+    _, j2_a2 = post_execute(body2_a2)
+    check("同一根下二次驱动仍 → LEAF_CONSUMED",
+          j2_a2.get("accepted") is False
+          and j2_a2.get("evaluation", {}).get("first_reason") == C.REASON_LEAF_CONSUMED,
+          str(j2_a2.get("evaluation", {}).get("first_reason")))
+
+
 def scenario_http_smoke() -> None:
-    print("\n=== 场景 4：健康/页面/内置演练包冒烟 ===")
+    print("\n=== 场景 5：健康/页面/内置演练包冒烟 ===")
     h = httpx.get(BASE_URL + "/healthz", timeout=TIMEOUT)
     check("GET /healthz → 200 status=ok",
           h.status_code == 200 and h.json().get("status") == "ok")
@@ -240,7 +338,7 @@ def scenario_http_smoke() -> None:
 
 
 def run_pytest_suite() -> bool:
-    print("\n=== 场景 5：pytest 全量单元/集成测试 ===")
+    print("\n=== 场景 6：pytest 全量单元/集成测试 ===")
     env = os.environ.copy()
     env["MDMS_DB_PATH"] = "/tmp/mdms-verify.db"
     env["PYTHONPATH"] = str(SRV_DIR)
@@ -260,6 +358,7 @@ def main() -> int:
     scenario_valid_execution_and_retry()
     scenario_concurrent_retransmit()
     scenario_tamper_rejections()
+    scenario_root_isolation()
     scenario_http_smoke()
     pytest_ok = run_pytest_suite()
 
