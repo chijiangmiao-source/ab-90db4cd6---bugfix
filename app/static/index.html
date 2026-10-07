@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>隔离维护站 · 设备指令委托链裁决</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171e26; --panel2: #1d2731; --line: #2b3947;
+    --text: #d7e0ea; --muted: #8aa0b4; --ok: #3fb96b; --bad: #e05d5d;
+    --warn: #d9a441; --accent: #4f9cff; --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { padding: 20px 24px 60px; max-width: 1280px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  textarea { width: 100%; min-height: 200px; background: #0b1016; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px; font: 12px/1.5 var(--mono); resize: vertical; }
+  .btns { display: flex; gap: 10px; margin: 12px 0 0; flex-wrap: wrap; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 16px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #08121f; font-weight: 600; }
+  button.danger { background: #5a2323; border-color: #7a3434; color: #ffd9d9; }
+  .banner { border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; display: none; }
+  .banner.ok { display: block; background: #13251a; border: 1px solid #245035; color: #8fe0aa; }
+  .banner.bad { display: block; background: #2a1414; border: 1px solid #5d2828; color: #f1a0a0; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); color: var(--muted); font-weight: 600; }
+  td.mono, .mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px; border: 1px solid var(--line); }
+  .pill.ok { color: var(--ok); border-color: #245035; }
+  .pill.bad { color: var(--bad); border-color: #5d2828; }
+  .pill.warn { color: var(--warn); border-color: #5a4820; }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; font-size: 12px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+  pre { background: #0b1016; border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow:auto;
+    font: 11.5px/1.5 var(--mono); max-height: 360px; }
+  .muted { color: var(--muted); }
+  .tag-exec { color: var(--ok); } .tag-rej { color: var(--bad); }
+  .full { grid-column: 1 / -1; }
+  details summary { cursor: pointer; color: var(--muted); margin: 6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>隔离维护站 · 设备指令委托链裁决</h1>
+  <span class="sub">Ed25519 逐级签名 · 范围严格收窄 · 末级凭据一次性 · 持久化裁决与稳定回执</span>
+  <span id="health" class="pill">健康检查中…</span>
+</header>
+<main>
+  <div class="grid">
+    <section class="panel">
+      <h2>① 外部签发的委托包（规范 UTF-8 JSON）</h2>
+      <textarea id="packet" spellcheck="false" placeholder='{"root_pubkey":"…","chain":[{"header":{…},"signature":"…"}]}'></textarea>
+    </section>
+    <section class="panel">
+      <h2>② 待执行命令请求（载荷 + 叶项主体签名）</h2>
+      <textarea id="request" spellcheck="false" placeholder='{"payload":{"device":"dev-alpha","command":"status","nonce":"…"},"payload_signature":"…"}'></textarea>
+      <div class="btns">
+        <button id="loadDrill">加载内置演练包</button>
+        <button id="loadRevoked">加载撤销演练包</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="btns" style="margin:16px 0">
+    <button id="inspect" class="primary">逐级核验（不执行）</button>
+    <button id="execute" class="danger">发起一次执行</button>
+    <button id="refresh"><span style="font-family:var(--mono)">↻</span> 刷新裁决台账</button>
+  </div>
+
+  <div id="banner" class="banner"></div>
+
+  <div class="grid">
+    <section class="panel full">
+      <h2>裁决身份要素</h2>
+      <dl class="kv">
+        <dt>根公钥</dt><dd id="f-root" class="mono">-</dd>
+        <dt>链摘要 chain_digest</dt><dd id="f-chain" class="mono">-</dd>
+        <dt>叶项标识 leaf_id</dt><dd id="f-leaf" class="mono">-</dd>
+        <dt>首个拒因</dt><dd id="f-reason">-</dd>
+      </dl>
+    </section>
+
+    <section class="panel full">
+      <h2>逐级签名 · 父子主体 · 范围收窄 · 失效时间</h2>
+      <div style="overflow:auto"><table id="levels">
+        <thead><tr>
+          <th>#</th><th>签发者 → 被授权主体</th><th>父摘要绑定</th><th>签名</th>
+          <th>设备范围</th><th>命令集合</th><th>范围收窄</th><th>失效时间</th><th>状态</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div id="revbox" style="margin-top:10px"></div>
+    </section>
+
+    <section class="panel full">
+      <h2>执行回执（并发重传逐字稳定，重启可复核）</h2>
+      <pre id="receipt" class="muted">尚未执行。</pre>
+    </section>
+
+    <section class="panel full">
+      <h2>持久化裁决台账（最近 20 条）</h2>
+      <div style="overflow:auto"><table id="ledger">
+        <thead><tr><th>时间</th><th>裁决</th><th>拒因</th><th>叶项标识</th><th>命令</th><th>request_digest</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const short = (s, n=10) => !s || s === "-" ? "-" : (s.length > n*2 ? s.slice(0,n) + "…" + s.slice(-6) : s);
+const pill = (ok, t, f) => ok === null ? '<span class="pill">未检</span>'
+  : `<span class="pill ${ok ? "ok" : "bad"}">${ok ? t : f}</span>`;
+const fmtTs = (ts) => ts ? new Date(ts*1000).toLocaleString("zh-CN", {hour12:false}) : "-";
+
+async function checkHealth() {
+  try {
+    const r = await fetch("/healthz"); const j = await r.json();
+    $("health").className = "pill ok"; $("health").textContent = "服务健康 · 执行记录 " + j.execution_records;
+  } catch { $("health").className = "pill bad"; $("health").textContent = "服务不可达"; }
+}
+
+async function loadDrill(kind="valid") {
+  const j = await (await fetch("/api/drill")).json();
+  const d = j[kind];
+  $("packet").value = d.packet_text;
+  $("request").value = d.request_text;
+  setBanner(false, `已加载：${d.name}（叶项标识 ${short(d.expected_leaf_id, 14)}）`);
+}
+
+function setBanner(ok, msg) {
+  const b = $("banner");
+  b.className = "banner " + (ok ? "ok" : "bad");
+  b.textContent = msg;
+}
+
+function renderEvaluation(ev) {
+  $("f-root").textContent = ev.root_pubkey || "-";
+  $("f-chain").textContent = ev.chain_digest || "-";
+  $("f-leaf").textContent = ev.leaf_id || "-";
+  const reasonCell = ev.first_reason
+    ? `<span class="pill bad">${ev.first_reason}</span> ${ev.first_reason_text || ""}`
+    : '<span class="pill ok">无拒因</span>';
+  $("f-reason").innerHTML = reasonCell;
+
+  const tb = $("levels").querySelector("tbody"); tb.innerHTML = "";
+  for (const it of ev.items || []) {
+    const tr = document.createElement("tr");
+    const err = it.error ? `<div class="tag-rej">${it.error}</div>` : "";
+    tr.innerHTML = `
+      <td>${it.index}</td>
+      <td class="mono">${short(it.issuer_pubkey)}<br>↓<br>${short(it.subject_pubkey)}</td>
+      <td>${pill(it.parent_binding_ok, "已绑定", "不匹配")}<div class="mono muted">${short(it.parent_digest)}</div></td>
+      <td>${pill(it.signature_ok, "验签通过", "验签失败")}</td>
+      <td class="mono">${(it.devices||[]).join("<br>")}</td>
+      <td class="mono">${(it.commands||[]).join("<br>")}</td>
+      <td>${it.index === 0 ? '<span class="pill">初始范围</span>' : pill(it.scope_narrowed, "严格收窄", "未收窄")}</td>
+      <td>${fmtTs(it.expires_at)}${it.expired ? '<div class="tag-rej">已过期</div>' : ""}</td>
+      <td>${it.revoked ? '<span class="pill bad">已撤销</span>' : (it.error ? '<span class="pill bad">拒绝</span>' : '<span class="pill ok">有效</span>')}${err}</td>`;
+    tb.appendChild(tr);
+  }
+
+  const rb = $("revbox"); rb.innerHTML = "";
+  if ((ev.revocations||[]).length) {
+    rb.innerHTML = "<div class='muted' style='margin-bottom:4px'>包级撤销声明（根公钥签署）：</div>" +
+      "<table><thead><tr><th>#</th><th>撤销目标</th><th>失效时间</th><th>验签</th></tr></thead><tbody>" +
+      ev.revocations.map(r => `<tr><td>${r.index}</td><td class="mono">${(r.revokes||[]).map(x=>short(x,14)).join("<br>")}</td>
+        <td>${fmtTs(r.expires_at)}${r.expired?" <span class='tag-rej'>已过期</span>":""}</td>
+        <td>${pill(r.signature_ok,"通过","失败")}${r.error?` <span class="tag-rej">${r.error}</span>`:""}</td></tr>`).join("") +
+      "</tbody></table>" +
+      (ev.revoked_by_persisted ? "<p class='tag-rej' style='margin-top:6px'>注意：该叶项在站内撤销名册中已全局失效（即使本包剥离撤销声明仍拒绝）。</p>" : "");
+  }
+}
+
+async function submit(path, okMsg) {
+  let body;
+  try {
+    body = JSON.stringify({ packet_text: $("packet").value, request_text: $("request").value });
+  } catch (e) { setBanner(false, "输入无法序列化：" + e); return; }
+  let j;
+  try {
+    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body});
+    j = await r.json();
+  } catch (e) { setBanner(false, "请求失败：" + e); return; }
+  if (j.detail) {
+    setBanner(false, `${j.detail.code || "ERROR"}：${j.detail.message || ""}`);
+    return;
+  }
+  renderEvaluation(j.evaluation);
+  if (j.receipt) {
+    $("receipt").classList.remove("muted");
+    $("receipt").textContent = JSON.stringify(j.receipt, null, 2);
+  } else {
+    $("receipt").classList.add("muted");
+    $("receipt").textContent = "本裁决无持久化回执（身份要素不完整，未留下任何记录）。";
+  }
+  if (j.accepted) {
+    setBanner(true, `${okMsg}${j.duplicate ? "（命中既有裁决：这是重传/并发收敛后的同一回执，设备未重复执行）" : ""}`);
+  } else {
+    setBanner(false, `裁决拒绝：${j.evaluation.first_reason} — ${j.evaluation.first_reason_text || ""}` +
+      (j.receipt ? "（已落 REJECTED 裁决，绝无执行记录）" : ""));
+  }
+  refreshLedger(); checkHealth();
+}
+
+async function refreshLedger() {
+  const j = await (await fetch("/api/decisions?limit=20")).json();
+  const tb = $("ledger").querySelector("tbody"); tb.innerHTML = "";
+  for (const d of j.decisions) {
+    const tr = document.createElement("tr");
+    const execTag = d.status === "EXECUTED"
+      ? '<span class="pill ok tag-exec">EXECUTED</span>'
+      : '<span class="pill bad tag-rej">REJECTED</span>';
+    tr.innerHTML = `<td>${fmtTs(d.created_at)}</td><td>${execTag}${d.duplicate?" 重传":""}</td>
+      <td class="mono">${d.reason ? d.reason + "<br><span class='muted'>"+(d.reason_text||"")+"</span>" : "-"}</td>
+      <td class="mono">${short(d.leaf_id)}</td>
+      <td class="mono">${d.payload.device || "-"} / ${d.payload.command || "-"}${d.command_id ? "<br><span class='muted'>"+d.command_id+"</span>" : ""}</td>
+      <td class="mono"><a href="/api/receipt/${d.request_digest}" target="_blank">${short(d.request_digest)}</a></td>`;
+    tb.appendChild(tr);
+  }
+}
+
+$("loadDrill").onclick = () => loadDrill("valid");
+$("loadRevoked").onclick = () => loadDrill("revoked");
+$("inspect").onclick = () => submit("/api/inspect", "逐级核验通过（未执行、未落盘）。");
+$("execute").onclick = () => submit("/api/execute", "执行成功：裁决已持久化。");
+$("refresh").onclick = refreshLedger;
+checkHealth(); refreshLedger();
+</script>
+</body>
+</html>
